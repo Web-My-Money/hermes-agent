@@ -741,6 +741,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_network_error_count: int = 0
+        # ISO-8601 start of the CURRENT continuous polling-reconnect episode,
+        # or None while polling is healthy. Doubles as the "have we already
+        # published a degraded platform state?" latch so the recovery write
+        # fires exactly once instead of on every getUpdates round-trip.
+        self._polling_retrying_since: Optional[str] = None
         self._polling_generation: int = 0
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting: bool = False
@@ -2509,6 +2514,10 @@ class TelegramAdapter(BasePlatformAdapter):
         else:
             self._polling_conflict_count = 0
         self._send_path_degraded = False
+        # Confirmed getUpdates progress is the only honest "connected" signal —
+        # a restarted Updater alone proves nothing (#90504). Clear the degraded
+        # platform state here so /api/status recovers on the same evidence.
+        self._publish_polling_recovered()
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
@@ -2897,6 +2906,62 @@ class TelegramAdapter(BasePlatformAdapter):
                 return False
             raise
 
+    def _publish_polling_retrying(self, error: Exception) -> None:
+        """Push the in-adapter reconnect ladder into ``gateway_state.json``.
+
+        The gateway's own reconnect watcher (gateway/run.py, OOF-156) only
+        publishes ``retrying``/``needs_attention`` for platforms that already
+        sit in ``_failed_platforms``. This ladder runs BEFORE that: polling is
+        fully dead — no getUpdates, no inbound messages — yet the platform is
+        still a live adapter, so nothing wrote a state update and
+        ``/api/status`` kept serving the ``connected`` entry stamped by
+        ``_mark_connected()`` at boot, with an ``updated_at`` frozen at gateway
+        start. During the 2026-08-24 outage that reported
+        ``telegram: connected, needs_attention: false, overall: ok`` for 9.5
+        hours while the bot received nothing.
+
+        Publishing on every ladder attempt fixes both halves: the state stops
+        claiming ``connected``, and ``updated_at`` advances, so a ladder that
+        then wedges mid-walk (#66377) goes visibly stale instead of looking
+        healthy forever.
+
+        ``needs_attention`` is set from the first attempt on purpose, unlike
+        the gateway watcher's multi-hour ``_RECONNECT_ATTENTION_AFTER_SECONDS``
+        threshold: this ladder is bounded at MAX_NETWORK_RETRIES (~7 minutes)
+        before it escalates to a retryable-fatal, so there is no long tail for
+        a threshold to filter and a blip here already means total deafness.
+        """
+        # getattr: ``object.__new__(TelegramAdapter)`` test harnesses never run
+        # __init__ — same guard the sibling status helpers already use.
+        if getattr(self, "_polling_retrying_since", None) is None:
+            self._polling_retrying_since = datetime.now(timezone.utc).isoformat()
+        self._write_runtime_status_safe(
+            "polling-retrying",
+            platform_state="retrying",
+            error_code="telegram_network_error",
+            error_message=_redact_telegram_error_text(error),
+            needs_attention=True,
+            retrying_since=self._polling_retrying_since,
+        )
+
+    def _publish_polling_recovered(self) -> None:
+        """Clear the degraded platform state once getUpdates progresses again.
+
+        Latched on ``_polling_retrying_since`` so this writes once per outage
+        rather than on every confirmed poll.
+        """
+        if getattr(self, "_polling_retrying_since", None) is None:
+            return
+        self._polling_retrying_since = None
+        self._write_runtime_status_safe(
+            "polling-recovered",
+            platform_state="connected",
+            error_code=None,
+            error_message=None,
+            needs_attention=False,
+            retrying_since=None,
+        )
+
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption.
 
@@ -2921,6 +2986,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count += 1
         self._send_path_degraded = True
         attempt = self._polling_network_error_count
+        # Publish before the escalation branch and before the backoff sleep:
+        # the health API must reflect "retrying" for the whole ladder, not
+        # only after it gives up.
+        self._publish_polling_retrying(error)
 
         if attempt > MAX_NETWORK_RETRIES:
             message = (
