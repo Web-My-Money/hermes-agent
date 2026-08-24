@@ -166,7 +166,13 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 return response
             except Exception as exc:
                 last_error = exc
-                if not _is_retryable_connect_error(exc):
+                if not _is_retryable_transport_error(exc, request):
+                    logger.warning(
+                        "[Telegram] %s on %s is not replay-safe on a second path; "
+                        "abandoning the fallback walk",
+                        type(exc).__name__,
+                        _bot_api_method(request) or "<unknown method>",
+                    )
                     raise
                 path = ip or _TELEGRAM_API_HOST
                 failure = _describe_transport_error(exc)
@@ -301,5 +307,83 @@ def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
     return httpx.Request(method=request.method, url=url, headers=headers, stream=request.stream, extensions=extensions)
 
 
-def _is_retryable_connect_error(exc: Exception) -> bool:
-    return isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError))
+# Bot API methods whose repetition is observably a no-op, so they may be
+# replayed against a different IPv4 path even when the first attempt may
+# already have been executed by Telegram's edge:
+#   * ``get*``        — pure queries. ``getUpdates`` included: the read offset
+#                       only advances on the NEXT call, so a replay confirms
+#                       exactly what the lost attempt would have confirmed.
+#   * ``deleteWebhook`` — deleting an absent webhook still returns ok:true.
+# Deliberately NOT here: ``sendMessage``/``sendPhoto``/``editMessageText`` and
+# every other mutation. A ReadTimeout on a send means the message may already
+# be in the chat; replaying it on the next seed IP would post it twice.
+# Second reason the set stays this narrow: replay-safe methods never carry a
+# multipart upload body, so their ``request.stream`` is an in-memory byte
+# stream that a second transport can actually re-read. A file-upload POST
+# cannot be re-sent at all — its stream is already consumed.
+_REPLAY_SAFE_METHOD_PREFIXES = ("get",)
+_REPLAY_SAFE_METHODS = frozenset({"deletewebhook"})
+
+# ``https://api.telegram.org/file/bot<token>/<file_path>`` — a plain static
+# download, not a Bot API method call. Idempotent by construction.
+_FILE_DOWNLOAD_PREFIX = "/file/"
+
+
+def _bot_api_method(request: httpx.Request) -> str:
+    """Return the lowercased Bot API method from ``/bot<token>/<method>``.
+
+    Only the last path segment is returned, so the bot token embedded earlier
+    in the path is never handed to a caller (or a log line).
+    """
+    return (request.url.path or "").rsplit("/", 1)[-1].lower()
+
+
+def _is_replay_safe_request(request: httpx.Request) -> bool:
+    """True when repeating this exact request cannot cause a duplicate effect."""
+    if (request.url.path or "").startswith(_FILE_DOWNLOAD_PREFIX):
+        return True
+    method = _bot_api_method(request)
+    return method in _REPLAY_SAFE_METHODS or method.startswith(
+        _REPLAY_SAFE_METHOD_PREFIXES
+    )
+
+
+def _is_retryable_transport_error(exc: Exception, request: httpx.Request) -> bool:
+    """Should the fallback walk continue to the next candidate path?
+
+    Two tiers, because retry safety depends on how far the request got.
+
+    Tier 1 — the request provably never reached Telegram: the pool never
+    handed out a connection (``PoolTimeout``) or the TCP/TLS handshake itself
+    failed (``ConnectTimeout``/``ConnectError``). Nothing was executed, so ANY
+    method may be walked to the next IP.
+
+    Tier 2 — the connection was established and the exchange was then lost
+    (``ReadTimeout``/``ReadError``/``WriteTimeout``/``WriteError``/
+    ``RemoteProtocolError``, the last being the usual shape of a CLOSE-WAIT
+    socket, cf. #63311). Telegram may already have executed the request, so
+    only replay-safe methods walk — see ``_REPLAY_SAFE_METHODS``.
+
+    Tier 2 used to be absent entirely: the predicate matched connect errors
+    only, so a ``ReadTimeout`` hit the caller's bare ``raise`` and skipped the
+    IPv4 seed walk that this whole transport exists to perform. That is what
+    took the gateway down for 9.5h on 2026-08-24 — ``bootstrap_del_webhook``
+    (``deleteWebhook``) read-timed-out on the primary path while both seed IPs
+    were healthy, and the fallback never ran (#87015 follow-up).
+    """
+    if isinstance(
+        exc, (httpx.ConnectTimeout, httpx.ConnectError, httpx.PoolTimeout)
+    ):
+        return True
+    if isinstance(
+        exc,
+        (
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.ReadError,
+            httpx.WriteError,
+            httpx.RemoteProtocolError,
+        ),
+    ):
+        return _is_replay_safe_request(request)
+    return False

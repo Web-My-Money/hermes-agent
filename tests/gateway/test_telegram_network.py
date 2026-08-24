@@ -507,3 +507,135 @@ class TestDiscoverFallbackIps:
 
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Retryability tiers — read/write failures walk the fallback IPs too, but only
+# for requests that are safe to repeat.
+#
+# Regression cover for the 2026-08-24 gateway outage: bootstrap_del_webhook
+# raised httpx.ReadTimeout, the predicate matched connect errors only, and the
+# whole IPv4 seed walk was skipped even though both seed IPs were healthy.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestRetryableTransportError:
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ConnectTimeout("t"),
+            httpx.ConnectError("e"),
+            httpx.PoolTimeout("p"),
+        ],
+    )
+    def test_never_reached_the_wire_is_retryable_for_any_method(self, exc):
+        """No bytes delivered — even a send may safely walk to the next IP."""
+        request = _telegram_request("/botTOKEN/sendMessage")
+        assert tnet._is_retryable_transport_error(exc, request) is True
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ReadTimeout("t"),
+            httpx.WriteTimeout("t"),
+            httpx.ReadError("e"),
+            httpx.WriteError("e"),
+            httpx.RemoteProtocolError("e"),
+        ],
+    )
+    def test_lost_exchange_is_retryable_for_replay_safe_methods(self, exc):
+        for path in (
+            "/botTOKEN/deleteWebhook",
+            "/botTOKEN/getUpdates",
+            "/botTOKEN/getMe",
+            "/file/botTOKEN/photos/file_1.jpg",
+        ):
+            assert tnet._is_retryable_transport_error(exc, _telegram_request(path)) is True, path
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            httpx.ReadTimeout("t"),
+            httpx.WriteTimeout("t"),
+            httpx.ReadError("e"),
+            httpx.WriteError("e"),
+            httpx.RemoteProtocolError("e"),
+        ],
+    )
+    def test_lost_exchange_is_not_retryable_for_mutations(self, exc):
+        """A ReadTimeout on sendMessage may mean the message WAS delivered."""
+        for path in (
+            "/botTOKEN/sendMessage",
+            "/botTOKEN/sendPhoto",
+            "/botTOKEN/editMessageText",
+            "/botTOKEN/setWebhook",
+        ):
+            assert tnet._is_retryable_transport_error(exc, _telegram_request(path)) is False, path
+
+    def test_unrelated_exception_is_not_retryable(self):
+        request = _telegram_request("/botTOKEN/getMe")
+        assert tnet._is_retryable_transport_error(RuntimeError("boom"), request) is False
+
+    def test_bot_api_method_never_exposes_the_token(self):
+        assert tnet._bot_api_method(_telegram_request("/bot123:SECRET/getMe")) == "getme"
+
+
+class TestReadTimeoutWalksFallbackIps:
+    """The outage scenario, end to end through the transport."""
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_on_delete_webhook_falls_through_to_seed_ip(self, monkeypatch):
+        calls = []
+        behavior = {
+            "149.154.166.110": httpx.ReadTimeout("read timed out"),
+            "149.154.167.220": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior)
+        )
+        transport = tnet.TelegramFallbackTransport(list(tnet.SEED_FALLBACK_IPS))
+
+        resp = await transport.handle_async_request(
+            _telegram_request("/botTOKEN/deleteWebhook")
+        )
+
+        assert resp.status_code == 200
+        assert [c["url_host"] for c in calls] == ["149.154.166.110", "149.154.167.220"]
+        assert transport._sticky_ip == "149.154.167.220"
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_on_send_message_does_not_walk(self, monkeypatch):
+        """Duplicate-delivery guard: a send stops at the first lost exchange."""
+        calls = []
+        behavior = {
+            "149.154.166.110": httpx.ReadTimeout("read timed out"),
+            "149.154.167.220": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior)
+        )
+        transport = tnet.TelegramFallbackTransport(list(tnet.SEED_FALLBACK_IPS))
+
+        with pytest.raises(httpx.ReadTimeout):
+            await transport.handle_async_request(
+                _telegram_request("/botTOKEN/sendMessage")
+            )
+
+        assert [c["url_host"] for c in calls] == ["149.154.166.110"]
+
+    @pytest.mark.asyncio
+    async def test_connect_error_still_walks_for_a_mutation(self, monkeypatch):
+        """Tier 1 is unchanged: connect failures retry regardless of method."""
+        calls = []
+        behavior = {
+            "149.154.166.110": "connect_error",
+            "149.154.167.220": "ok",
+        }
+        monkeypatch.setattr(
+            tnet.httpx, "AsyncHTTPTransport", _fake_transport_factory(calls, behavior)
+        )
+        transport = tnet.TelegramFallbackTransport(list(tnet.SEED_FALLBACK_IPS))
+
+        resp = await transport.handle_async_request(
+            _telegram_request("/botTOKEN/sendMessage")
+        )
+
+        assert resp.status_code == 200
+        assert [c["url_host"] for c in calls] == ["149.154.166.110", "149.154.167.220"]

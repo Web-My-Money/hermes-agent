@@ -989,3 +989,83 @@ async def test_drain_rebuild_does_not_block_loop_or_leak_cleanup_task(monkeypatc
         "stale-client cleanup must finish or abandon its own wedged close "
         "without accumulating a background task"
     )
+
+
+# ---------------------------------------------------------------------------
+# Health-API visibility of the in-adapter reconnect ladder.
+#
+# Regression cover for the 2026-08-24 outage: /api/status served
+# ``telegram: {state: connected, needs_attention: false, retrying_since: null}``
+# with an ``updated_at`` frozen at gateway boot for the full 9.5 hours the
+# ladder was running, because nothing on this path wrote platform state.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_network_error_ladder_publishes_retrying_platform_state():
+    adapter = _make_adapter()
+
+    mock_updater = MagicMock()
+    mock_updater.running = False
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    adapter._app = mock_app
+
+    with patch("gateway.status.publish_runtime_status") as write_status, \
+            patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_network_error(Exception("Timed out"))
+
+    retrying = [
+        c.kwargs for c in write_status.call_args_list
+        if c.kwargs.get("platform_state") == "retrying"
+    ]
+    assert retrying, "ladder must publish a retrying platform state"
+    published = retrying[0]
+    assert published["platform"] == "telegram"
+    assert published["needs_attention"] is True
+    assert published["retrying_since"] is not None
+    assert published["error_code"] == "telegram_network_error"
+
+
+@pytest.mark.asyncio
+async def test_retrying_since_is_stable_across_ladder_attempts():
+    """One episode = one start timestamp, not a fresh clock every attempt."""
+    adapter = _make_adapter()
+    adapter._publish_polling_retrying(Exception("first"))
+    first = adapter._polling_retrying_since
+    adapter._publish_polling_retrying(Exception("second"))
+    assert adapter._polling_retrying_since == first
+
+
+@pytest.mark.asyncio
+async def test_confirmed_polling_progress_clears_degraded_state():
+    adapter = _make_adapter()
+    adapter._publish_polling_retrying(Exception("Timed out"))
+    adapter._polling_progress_accepting = True
+    adapter._polling_generation = 7
+
+    with patch("gateway.status.publish_runtime_status") as write_status:
+        adapter._record_polling_progress(7)
+        # A second confirmed poll must not re-write — the latch clears once.
+        adapter._record_polling_progress(7)
+
+    assert write_status.call_count == 1
+    published = write_status.call_args_list[0].kwargs
+    assert published["platform_state"] == "connected"
+    assert published["needs_attention"] is False
+    assert published["retrying_since"] is None
+    assert adapter._polling_retrying_since is None
+
+
+@pytest.mark.asyncio
+async def test_healthy_polling_progress_does_not_write_status():
+    """No outage in flight — the hot path must stay write-free."""
+    adapter = _make_adapter()
+    adapter._polling_progress_accepting = True
+    adapter._polling_generation = 3
+
+    with patch("gateway.status.publish_runtime_status") as write_status:
+        adapter._record_polling_progress(3)
+
+    write_status.assert_not_called()

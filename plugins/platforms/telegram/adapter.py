@@ -607,6 +607,11 @@ class TelegramAdapter(BasePlatformAdapter):
         self._post_connect_task: Optional[asyncio.Task] = None  # command menu + DM topics, off the connect path
         self._polling_conflict_count = self._polling_network_error_count = self._polling_generation = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
+        # WMM: ISO-8601 start of the CURRENT continuous polling-reconnect episode,
+        # or None while polling is healthy. Doubles as the "have we already
+        # published a degraded platform state?" latch so the recovery write
+        # fires exactly once instead of on every getUpdates round-trip.
+        self._polling_retrying_since: Optional[str] = None
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting = self._polling_teardown_started = False
         self._polling_error_callback_ref = None
@@ -1775,6 +1780,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 "connected", platform_state="connected", error_code=None, error_message=None,
             )
         self._send_path_degraded = False
+        # WMM: confirmed getUpdates progress is the only honest "connected"
+        # signal — clear needs_attention/retrying_since on the same evidence.
+        self._publish_polling_recovered()
         return True
 
     def _observe_polling_request_result(self, request, generation, result):
@@ -2083,6 +2091,49 @@ class TelegramAdapter(BasePlatformAdapter):
         """Run a recovery coroutine as the tracked in-flight ``_polling_error_task``."""
         self._polling_error_task = asyncio.get_running_loop().create_task(coro)
 
+    def _publish_polling_retrying(self, error: Exception) -> None:
+        """WMM: push the in-adapter reconnect ladder into ``gateway_state.json``.
+
+        Upstream's ``_mark_degraded()`` publishes ``retrying`` only when recovery
+        is scheduled via ``_schedule_polling_recovery``; the polling error
+        callback spawns this ladder directly, so without this the platform kept
+        serving the ``connected`` entry stamped at boot (2026-08-24: 9.5 h of a
+        deaf bot reported as ``overall: ok``). Also stamps ``retrying_since`` and
+        ``needs_attention`` so an external watchdog can alert on episode age,
+        and advances ``updated_at`` so a ladder that wedges goes visibly stale.
+        ``needs_attention`` is set from attempt 1: the ladder is bounded
+        (~7 min) before it escalates, so there is no long tail to filter.
+        """
+        # getattr: ``object.__new__(TelegramAdapter)`` harnesses never run __init__.
+        if getattr(self, "_polling_retrying_since", None) is None:
+            self._polling_retrying_since = datetime.now(timezone.utc).isoformat()
+        self._write_runtime_status_safe(
+            "polling-retrying",
+            platform_state="retrying",
+            error_code="telegram_network_error",
+            error_message=_redact_telegram_error_text(error),
+            needs_attention=True,
+            retrying_since=self._polling_retrying_since,
+        )
+
+    def _publish_polling_recovered(self) -> None:
+        """WMM: clear the degraded state once getUpdates progresses again.
+
+        Latched on ``_polling_retrying_since`` so this writes once per outage
+        rather than on every confirmed poll.
+        """
+        if getattr(self, "_polling_retrying_since", None) is None:
+            return
+        self._polling_retrying_since = None
+        self._write_runtime_status_safe(
+            "polling-recovered",
+            platform_state="connected",
+            error_code=None,
+            error_message=None,
+            needs_attention=False,
+            retrying_since=None,
+        )
+
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption (NetworkError/TimedOut).
 
@@ -2108,6 +2159,9 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_network_error_count += 1
         self._send_path_degraded = True
         attempt = self._polling_network_error_count
+        # WMM: publish before the escalation branch and before the backoff
+        # sleep — the health API must say "retrying" for the whole ladder.
+        self._publish_polling_retrying(error)
         if attempt > MAX_NETWORK_RETRIES:
             message = (
                 "Telegram polling could not reconnect after %d network error retries. "
