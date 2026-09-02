@@ -2134,6 +2134,38 @@ class TelegramAdapter(BasePlatformAdapter):
             retrying_since=None,
         )
 
+    def _publish_polling_conflict_retrying(self, error: Exception) -> None:
+        """Publish ``retrying`` while the 409-conflict ladder walks.
+
+        The sibling network-error ladder already does this (#90504). This path
+        did not, and the two failure modes are indistinguishable from outside:
+        on 2026-09-02 the conflict ladder ran for four minutes while
+        ``/api/status`` kept serving the ``connected`` entry stamped by
+        ``_mark_connected()`` at boot — ``needs_attention: false``,
+        ``overall: ok`` — and no ``getUpdates`` had ever succeeded. Everything
+        downstream trusts that field, so a watchdog polling it saw a healthy
+        bot, and a human was told the bot was reachable when it was deaf.
+
+        Same latch and same ``needs_attention`` reasoning as the network
+        ladder: this one is bounded before it escalates to fatal, so there is
+        no long tail for a threshold to filter, and a conflict here already
+        means total deafness. ``updated_at`` advancing on every attempt is the
+        second half of the fix — a ladder that wedges mid-walk goes visibly
+        stale instead of looking healthy forever.
+        """
+        # getattr: ``object.__new__(TelegramAdapter)`` test harnesses never run
+        # __init__ — same guard the sibling status helpers already use.
+        if getattr(self, "_polling_retrying_since", None) is None:
+            self._polling_retrying_since = datetime.now(timezone.utc).isoformat()
+        self._write_runtime_status_safe(
+            "polling-conflict-retrying",
+            platform_state="retrying",
+            error_code="telegram_polling_conflict",
+            error_message=_redact_telegram_error_text(error),
+            needs_attention=True,
+            retrying_since=self._polling_retrying_since,
+        )
+
     async def _handle_polling_network_error(self, error: Exception) -> None:
         """Reconnect polling after a transient network interruption (NetworkError/TimedOut).
 
@@ -2505,8 +2537,25 @@ class TelegramAdapter(BasePlatformAdapter):
         if self.has_fatal_error and self.fatal_error_code == "telegram_polling_conflict":
             return
         self._polling_conflict_count += 1
-        MAX_CONFLICT_RETRIES = 5
-        # 15s, 25s, 35s, 45s, 55s — clears Telegram's ~30s session window without hammering the API.
+        # Delay grows with each attempt: 20s, 30s, 40s, ... (10 + 10n).
+        #
+        # The "~30s" figure below holds when the previous holder exited
+        # cleanly. It does not hold on a hosted redeploy: on Railway the
+        # outgoing container is SIGKILLed and a volume-attached service can
+        # overlap the incoming one, so the old session is still being
+        # re-established while the new one walks this ladder and the two steal
+        # the poll from each other. On 2026-09-02 a 5-attempt / 200s budget
+        # expired mid-overlap three times in a row, each time landing in
+        # ``telegram_polling_conflict`` fatal; recovery only stuck once the
+        # previous instance had been quiet for ~16 minutes. Ten attempts is
+        # ~650s of ladder, which covers that window, and matches
+        # MAX_NETWORK_RETRIES so the two ladders are no longer arbitrarily
+        # different. Env-tunable so this can be adjusted without a rebuild.
+        MAX_CONFLICT_RETRIES = int(
+            self._env_float_clamped(
+                "HERMES_TELEGRAM_MAX_CONFLICT_RETRIES", 10, min_value=1, max_value=30
+            )
+        )
         RETRY_DELAY = 10 + (self._polling_conflict_count * 10)  # seconds
         if self._polling_conflict_count <= MAX_CONFLICT_RETRIES:
             logger.warning(
@@ -2514,6 +2563,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 "held open on Telegram's servers. Waiting %ds for it to expire. Error: %s",
                 self.name, self._polling_conflict_count, MAX_CONFLICT_RETRIES,
                 RETRY_DELAY, _redact_telegram_error_text(error))
+            self._publish_polling_conflict_retrying(error)  # WMM: honest health while deaf
             # Stop the updater before sleeping (no-op if PTB raised before running was set).
             if not await self._stop_updater_or_go_fatal(self._app, "conflict-retry"):
                 return

@@ -645,3 +645,81 @@ async def test_conflict_callback_disarms_before_scheduling(monkeypatch):
     for _ in range(10):
         await asyncio.sleep(0)
     await _cancel_heartbeat(adapter)
+
+
+# ---------------------------------------------------------------------------
+# Regression: the 409-conflict ladder must publish platform state.
+#
+# The sibling network-error ladder already does (#90504). This one did not, so
+# from outside the two were indistinguishable: on 2026-09-02 the conflict
+# ladder walked for four minutes while /api/status still served the
+# `connected` entry stamped by _mark_connected() at boot — needs_attention
+# false, overall ok — and no getUpdates had ever succeeded. A watchdog polling
+# that field saw a healthy bot, and a human was told it was reachable.
+# ---------------------------------------------------------------------------
+
+def _conflict_adapter():
+    adapter = TelegramAdapter(PlatformConfig(enabled=True, token="***"))
+    mock_updater = MagicMock()
+    mock_updater.running = False
+    mock_updater.stop = AsyncMock()
+    mock_updater.start_polling = AsyncMock()
+    mock_app = MagicMock()
+    mock_app.updater = mock_updater
+    adapter._app = mock_app
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_conflict_ladder_publishes_retrying_platform_state(monkeypatch):
+    from unittest.mock import patch
+
+    adapter = _conflict_adapter()
+    conflict = type("Conflict", (Exception,), {})
+
+    with patch("gateway.status.publish_runtime_status") as write_status, \
+            patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_conflict(
+            conflict("Conflict: terminated by other getUpdates request")
+        )
+
+    retrying = [
+        c.kwargs for c in write_status.call_args_list
+        if c.kwargs.get("platform_state") == "retrying"
+    ]
+    assert retrying, "conflict ladder must publish a retrying platform state"
+    published = retrying[0]
+    assert published["platform"] == "telegram"
+    assert published["needs_attention"] is True
+    assert published["retrying_since"] is not None
+    assert published["error_code"] == "telegram_polling_conflict"
+
+
+@pytest.mark.asyncio
+async def test_conflict_retrying_since_is_stable_across_attempts():
+    """One conflict episode = one start timestamp, not a fresh clock per attempt."""
+    adapter = _conflict_adapter()
+    conflict = type("Conflict", (Exception,), {})
+    adapter._publish_polling_conflict_retrying(conflict("first"))
+    first = adapter._polling_retrying_since
+    adapter._publish_polling_conflict_retrying(conflict("second"))
+    assert adapter._polling_retrying_since == first
+
+
+@pytest.mark.asyncio
+async def test_conflict_retry_budget_is_env_tunable(monkeypatch):
+    """A hosted redeploy can hold the poll far longer than the old 200s budget."""
+    from unittest.mock import patch
+
+    adapter = _conflict_adapter()
+    fatal_handler = AsyncMock()
+    adapter.set_fatal_error_handler(fatal_handler)
+    conflict = type("Conflict", (Exception,), {})
+
+    # Budget of 1: the second attempt must exhaust it rather than retrying on.
+    monkeypatch.setenv("HERMES_TELEGRAM_MAX_CONFLICT_RETRIES", "1")
+    adapter._polling_conflict_count = 1
+    with patch("gateway.status.publish_runtime_status"), \
+            patch("asyncio.sleep", new_callable=AsyncMock):
+        await adapter._handle_polling_conflict(conflict("boom"))
+    assert adapter.fatal_error_code == "telegram_polling_conflict"
