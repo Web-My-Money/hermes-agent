@@ -233,7 +233,11 @@ def _get_approval_mode() -> str:
             return room_policy.approval_mode
     except Exception:
         pass
-    return _normalize_approval_mode(_get_approval_config().get("mode", "manual"))
+    cfg = _get_approval_config()
+    base = _normalize_approval_mode(cfg.get("mode", "manual"))
+    # WMM: a non-admin sender on a shared bot gets approvals.non_admin_mode (see tools/approval_principal.py).
+    from tools.approval_principal import effective_mode
+    return effective_mode(base, cfg)
 
 
 def _get_approval_timeout() -> int:

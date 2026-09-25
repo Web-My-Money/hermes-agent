@@ -1668,6 +1668,14 @@ DEFAULT_CONFIG = {
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
         "deny": [],
+        # WMM (tools/approval_principal.py): owner/teammate split on a shared bot, keyed on the SAME admin list
+        # as slash gating (platforms.<p>.allow_admin_from / group_allow_admin_from). All inert until set.
+        # non_admin_mode: "manual"/"smart" — a non-admin sender gets the stricter of this and `mode`.
+        # non_admin_deny: globs like `deny`, but only for non-admin senders (e.g. "*hermes pairing*").
+        # non_admin_approver_chat: {platform: chat_id} — deliver a non-admin's approval card to the owner.
+        "non_admin_mode": "",
+        "non_admin_deny": [],
+        "non_admin_approver_chat": {},
         # /reload-mcp confirms before rebuilding the MCP tool set (it invalidates the prompt cache,
         # so the next message re-sends full input). "Always Approve" → false.
         "mcp_reload_confirm": True,

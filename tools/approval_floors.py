@@ -28,10 +28,14 @@ def _match_user_deny_rule(command: str) -> str | None:
     the dangerous-pattern detector uses so quoting tricks (``r\\m``,
     ``git st""atus``) can't sidestep a rule."""
     try:
-        deny_patterns = _ctx._get_approval_config().get("deny") or []
+        approvals_cfg = _ctx._get_approval_config()
+        deny_patterns = approvals_cfg.get("deny") or []
     except Exception:
         return None
     globs = [p.strip() for p in deny_patterns if isinstance(p, str) and p.strip()]
+    # WMM: approvals.non_admin_deny applies only to a non-admin sender (tools/approval_principal.py).
+    from tools.approval_principal import non_admin_deny_globs
+    globs += non_admin_deny_globs(approvals_cfg)
     if not globs:
         return None
     for command_variant in _deny_command_variants(command):
