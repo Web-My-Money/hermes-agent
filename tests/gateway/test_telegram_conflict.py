@@ -677,7 +677,7 @@ async def test_conflict_ladder_publishes_retrying_platform_state(monkeypatch):
     adapter = _conflict_adapter()
     conflict = type("Conflict", (Exception,), {})
 
-    with patch("gateway.status.write_runtime_status") as write_status, \
+    with patch("gateway.status.publish_runtime_status") as write_status, \
             patch("asyncio.sleep", new_callable=AsyncMock):
         await adapter._handle_polling_conflict(
             conflict("Conflict: terminated by other getUpdates request")
@@ -719,7 +719,7 @@ async def test_conflict_retry_budget_is_env_tunable(monkeypatch):
     # Budget of 1: the second attempt must exhaust it rather than retrying on.
     monkeypatch.setenv("HERMES_TELEGRAM_MAX_CONFLICT_RETRIES", "1")
     adapter._polling_conflict_count = 1
-    with patch("gateway.status.write_runtime_status"), \
+    with patch("gateway.status.publish_runtime_status"), \
             patch("asyncio.sleep", new_callable=AsyncMock):
         await adapter._handle_polling_conflict(conflict("boom"))
     assert adapter.fatal_error_code == "telegram_polling_conflict"
