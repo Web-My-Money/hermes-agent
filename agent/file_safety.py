@@ -327,6 +327,11 @@ _CREDENTIAL_FILE_NAMES = (
 # the directory itself, message for a file inside). browser-profile/ is a copy
 # of the user's Cookies / Login Data — the same credential class as auth.json.
 _READ_DENIED_DIRS = (
+    # WMM: owner-only quarantine for old backups that predate de-secreting (MEMORY.md copies, state.db and
+    # config backups, old tarballs). Kept for recovery, never read by the agent's file tools.
+    ("backups/secret-bearing",
+     "is the quarantined secret-bearing backup directory and cannot be read by the agent.",
+     "is inside the quarantined secret-bearing backup directory and cannot be read by the agent."),
     ("mcp-tokens",
      "is the Hermes MCP token directory and cannot be read directly.",
      "is a Hermes MCP token file and cannot be read directly."),

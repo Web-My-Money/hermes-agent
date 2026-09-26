@@ -1473,19 +1473,41 @@ class TurnRunner:
         cmd = _redact_approval_command(approval_data.get("command", ""))
         desc = approval_data.get("description", "dangerous command")
         flags = {k: approval_data.get(k, d) for k, d in (("allow_permanent", True), ("allow_session", True), ("smart_denied", False))}
+        # WMM: a non-admin sender's card goes to the owner's chat (approvals.non_admin_approver_chat), so the
+        # owner decides, not the requester. No "always" for someone else's session. If the routed card cannot
+        # be sent, the text fallback below lands in the requester's chat, where a non-admin cannot /approve
+        # (slash gating) — the request then times out and is denied: fail closed.
+        from tools.approval_principal import approver_chat_for_current_session, requester_label
+        approver_chat = approver_chat_for_current_session() if _renders_exec_approval_buttons(type(adapter)) else None
+        card_chat, card_meta, card_desc = ctx._status_chat_id, ctx._status_thread_metadata, desc
+        if approver_chat:
+            card_chat, card_meta = approver_chat, None
+            card_desc = f"{desc} — requested by {requester_label()}"
+            flags["allow_permanent"] = False
         # Check the *class*, not the instance — MagicMock auto-creates attributes in tests.
         if _renders_exec_approval_buttons(type(adapter)):
             try:
                 fut = self._schedule(
                     adapter.send_exec_approval(
-                        chat_id=ctx._status_chat_id, command=cmd, session_key=ctx.session_key or "",
-                        description=desc, metadata=ctx._status_thread_metadata, **flags,
+                        chat_id=card_chat, command=cmd, session_key=ctx.session_key or "",
+                        description=card_desc, metadata=card_meta, **flags,
                     ),
                     "send_exec_approval scheduling error",
                 )
                 if fut is None:
                     raise RuntimeError("send_exec_approval: loop unavailable")
                 outcome = _approval_send_outcome(fut, timeout=15)
+                if outcome == "sent" and approver_chat:
+                    # The card lives in the owner's chat: tell the requester, and post any timeout
+                    # notice as a new message here (the card id belongs to the other chat).
+                    self._schedule(
+                        adapter.send(ctx._status_chat_id,
+                                     f"This needs the owner's approval ({desc}). I sent the request "
+                                     "to them and will continue if they approve it.",
+                                     metadata=_interim_metadata(ctx._status_thread_metadata)),
+                        "Approval routed-notice scheduling error")
+                    register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
+                    return
                 if outcome == "sent":
                     # Without this, a card whose timer runs out keeps live buttons and nobody
                     # learns the command did NOT run (only the TUI registered a settle hook).
