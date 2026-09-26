@@ -127,3 +127,13 @@ def test_approver_chat_only_for_teammates(cfg, as_user):
     assert principal.requester_label() == f"Carolina ({TEAMMATE})"
     as_user(OWNER)
     assert principal.approver_chat_for_current_session() is None
+
+
+def test_secret_bearing_backups_are_read_denied(tmp_path, monkeypatch):
+    from agent import file_safety
+    monkeypatch.setattr(file_safety, "_hermes_dirs", lambda: [tmp_path])
+    target = tmp_path / "backups" / "secret-bearing" / "MEMORY.md.bak"
+    target.parent.mkdir(parents=True)
+    target.write_text("x")
+    assert file_safety.get_read_block_error(str(target))
+    assert file_safety.get_read_block_error(str(tmp_path / "backups" / "other.txt")) is None
